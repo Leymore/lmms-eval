@@ -16,6 +16,7 @@ logger.add(sys.stdout, level="WARNING", format=log_format)
 AVAILABLE_SIMPLE_MODELS = {
     "aero": "Aero",
     "plm": "PerceptionLM",
+    "anthropic_compatible": "AnthropicCompatible",
     "aria": "Aria",
     "auroracap": "AuroraCap",
     "bagel": "Bagel",

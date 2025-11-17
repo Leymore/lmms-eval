@@ -2,13 +2,15 @@ import base64
 import json
 import os
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from typing import List, Tuple, Union
-from urllib.parse import unquote
 
 import numpy as np
+import requests as http_requests
 from accelerate import Accelerator, DistributedType
+from requests.auth import HTTPBasicAuth
 from tqdm import tqdm
 
 from lmms_eval.api.instance import Instance
@@ -22,67 +24,54 @@ except ImportError:
 
 from dotenv import load_dotenv
 from loguru import logger as eval_logger
-from openai import AzureOpenAI, DefaultHttpxClient, OpenAI
 from PIL import Image
-import requests
-from requests.auth import HTTPBasicAuth
 
 from qwen_vl_utils import process_vision_info
 
 load_dotenv(verbose=True)
 
-def get_client_api_key(api_service: str, ) -> str:
-    """
-    Requests a new API access token for the specified corporate account (OpenAI).
+MODEL_ALIAS_MAP = {
+    "claude-3.5-sonnet": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+    "claude-3-5-sonnet-20241022-v2": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+}
 
-    This function uses hardcoded client credentials (client_id and client_secret).
-    """
 
-    # Hardcoded credentials
+def get_client_api_key(api_service: str) -> str:
     client_id = os.getenv("AUTH_SERVER_CLIENT_ID", None)
     client_secret = os.getenv("AUTH_SERVER_CLIENT_SECRET", None)
     url = os.getenv("AUTH_SERVER_TOKEN_URL", None)
     assert client_id is not None and client_secret is not None and url is not None, "AUTH_SERVER_CLIENT_ID, AUTH_SERVER_CLIENT_SECRET, and AUTH_SERVER_TOKEN_URL must be set"
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    scope_map = {"oai": "azureopenai-readwrite"}
+    scope_map = {"anthropic": "awsanthropic-readwrite"}
     data = {"grant_type": "client_credentials", "scope": scope_map[api_service]}
 
-    response = requests.post(url, headers=headers, data=data, auth=HTTPBasicAuth(client_id, client_secret))
+    response = http_requests.post(url, headers=headers, data=data, auth=HTTPBasicAuth(client_id, client_secret))
     if response.status_code != 200:
         raise RuntimeError("Error: Could not generate a Bearer API token, please try again")
 
     return response.json()["access_token"]
 
 
-
-@register_model("openai_compatible")
-class OpenAICompatible(lmms):
+@register_model("anthropic_compatible")
+class AnthropicCompatible(lmms):
     def __init__(
         self,
-        model_version: str = "grok-2-latest",
-        base_url: str = None,
-        api_key: str = None,
+        model_version: str = "claude-3.5-sonnet",
         timeout: int = 10,
         max_retries: int = 5,
         max_size_in_mb: int = 20,
         continual_mode: bool = False,
         response_persistent_folder: str = None,
-        azure_openai: bool = False,
         max_frames_num: int = 32,
-        httpx_trust_env: bool = True,
         batch_size: int = 64,
         use_auth_api: bool = False,
-        reasoning_effort: str = None,
         **kwargs,
     ) -> None:
-        """
-        :param httpx_trust_env: bool
-            httpx.Client used by openai-python has trust_env set to True by default. A
-            False value of this param constructs a httpx.Client with trust_env set to
-            False.  Such a httpx.Client ignores environment variables (HTTP_PROXY,
-            HTTPS_PROXY, ALL_PROXY) and macOS proxy server settings.
-        """
         super().__init__()
+
+        if not use_auth_api:
+            raise NotImplementedError("Only use_auth_api=True is supported for anthropic_compatible")
+
         self.model_version = model_version
         self.timeout = timeout
         self.max_retries = max_retries
@@ -90,10 +79,12 @@ class OpenAICompatible(lmms):
         self.continual_mode = continual_mode
         self.max_frames_num = max_frames_num
         self.use_auth_api = use_auth_api
-        self.base_url = base_url
-        self.azure_openai = azure_openai
-        self.httpx_trust_env = httpx_trust_env
-        self.reasoning_effort = reasoning_effort
+
+        if model_version in MODEL_ALIAS_MAP:
+            self.model_name = MODEL_ALIAS_MAP[model_version]
+        else:
+            self.model_name = model_version
+
         if self.continual_mode:
             if response_persistent_folder is None:
                 raise ValueError("Continual mode requires a persistent path for the response. Please provide a valid path.")
@@ -110,38 +101,9 @@ class OpenAICompatible(lmms):
                 self.response_cache = {}
                 self.cache_mode = "start"
 
-        # In China mainland, people usually use a VPN client to access international web
-        # sites such as Google. Such a client usually configures macOS proxy server
-        # settings. openai-python uses a httpx.Client with trust_env set to True. Such a
-        # httpx.Client uses macOS proxy server settings. Adding httpx_trust_env option
-        # allows httpx to ignore proxy server settings set by VPN clients.
-        http_client = DefaultHttpxClient(trust_env=httpx_trust_env) if not httpx_trust_env else None
-
-        # Use provided parameters or fall back to environment variables
-        api_key = api_key or os.getenv("OPENAI_API_KEY")
-
-        if use_auth_api:
-            api_key = get_client_api_key("oai")
-
-        base_url = base_url or os.getenv("OPENAI_API_BASE")
-
-        # Fix URL encoding issue - decode if it's URL encoded
-        if base_url and "%" in base_url:
-            base_url = unquote(base_url)
-
-        # Remove trailing slash if present
-        if base_url and base_url.endswith("/"):
-            base_url = base_url.rstrip("/")
-
-        if azure_openai:
-            self.client = AzureOpenAI(api_key=os.getenv("AZURE_OPENAI_API_KEY"), azure_endpoint=os.getenv("AZURE_OPENAI_API_BASE"), api_version=os.getenv("AZURE_OPENAI_API_VERSION"), http_client=http_client)
-        elif use_auth_api:
-            self.client = OpenAI(api_key=api_key, base_url=base_url, default_headers={"dataClassification": "sensitive", "dataSource": "internet"})
-        else:
-            self.client = OpenAI(api_key=api_key, base_url=base_url, default_headers={"dataClassification": "sensitive", "dataSource": "internet"})
+        self.bearer_token = get_client_api_key("anthropic")
 
         accelerator = Accelerator()
-        # assert self.batch_size_per_gpu == 1, "Llava currently does not support batched generation. See https://github.com/haotian-liu/LLaVA/issues/754. HF Llava also has this issue."
         if accelerator.num_processes > 1:
             assert accelerator.distributed_type in [DistributedType.FSDP, DistributedType.MULTI_GPU, DistributedType.DEEPSPEED], "Unsupported distributed type provided. Only DDP and FSDP are supported."
             self.accelerator = accelerator
@@ -161,34 +123,9 @@ class OpenAICompatible(lmms):
     def batch_size(self):
         return self.batch_size_per_gpu
 
-    def refresh_token_and_client(self) -> None:
-        """Refresh the API token and recreate the client."""
-        if not self.use_auth_api:
-            eval_logger.warning("Token refresh requested but use_auth_api is False")
-            return
-
+    def refresh_token(self) -> None:
         eval_logger.info("Refreshing API token...")
-        api_key = get_client_api_key("oai")
-
-        # Determine base_url
-        base_url = self.base_url or os.getenv("OPENAI_API_BASE")
-
-        # Fix URL encoding issue - decode if it's URL encoded
-        if base_url and "%" in base_url:
-            base_url = unquote(base_url)
-
-        # Remove trailing slash if present
-        if base_url and base_url.endswith("/"):
-            base_url = base_url.rstrip("/")
-
-        # Recreate client with new token
-        http_client = DefaultHttpxClient(trust_env=self.httpx_trust_env) if not self.httpx_trust_env else None
-
-        if self.azure_openai:
-            self.client = AzureOpenAI(api_key=os.getenv("AZURE_OPENAI_API_KEY"), azure_endpoint=os.getenv("AZURE_OPENAI_API_BASE"), api_version=os.getenv("AZURE_OPENAI_API_VERSION"), http_client=http_client)
-        else:
-            self.client = OpenAI(api_key=api_key, base_url=base_url, default_headers={"dataClassification": "sensitive", "dataSource": "internet"})
-
+        self.bearer_token = get_client_api_key("anthropic")
         eval_logger.info("API token refreshed successfully")
 
     def tok_encode(self, string: str):
@@ -205,9 +142,8 @@ class OpenAICompatible(lmms):
     def rank(self):
         return self._rank
 
-    # Function to encode the image
     def encode_image(self, image: Union[Image.Image, str]):
-        max_size = self.max_size_in_mb * 1024 * 1024  # 20MB in bytes
+        max_size = self.max_size_in_mb * 1024 * 1024
         if isinstance(image, str):
             img = Image.open(image).convert("RGB")
         else:
@@ -217,7 +153,6 @@ class OpenAICompatible(lmms):
         img.save(output_buffer, format="PNG")
         byte_data = output_buffer.getvalue()
 
-        # If image is too large, resize it while maintaining aspect ratio
         while len(byte_data) > max_size and img.size[0] > 100 and img.size[1] > 100:
             new_size = (int(img.size[0] * 0.75), int(img.size[1] * 0.75))
             img = img.resize(new_size, Image.Resampling.LANCZOS)
@@ -227,9 +162,8 @@ class OpenAICompatible(lmms):
             byte_data = output_buffer.getvalue()
 
         base64_str = base64.b64encode(byte_data).decode("utf-8")
-        return base64_str
+        return base64_str, "image/png"
 
-    # Function to encode the video
     def encode_video(self, video_path, max_num_frames):
         if max_num_frames == 0:
             return []
@@ -278,7 +212,7 @@ class OpenAICompatible(lmms):
             img.save(output_buffer, format="PNG")
             byte_data = output_buffer.getvalue()
             base64_str = base64.b64encode(byte_data).decode("utf-8")
-            base64_frames.append(base64_str)
+            base64_frames.append((base64_str, "image/png"))
 
         return base64_frames
 
@@ -336,44 +270,31 @@ class OpenAICompatible(lmms):
                             frames = self.encode_video(visual, self.max_frames_num)
                             imgs.extend(frames)
                         elif isinstance(visual, str) and (".jpg" in visual or ".jpeg" in visual or ".png" in visual or ".gif" in visual or ".bmp" in visual or ".tiff" in visual or ".webp" in visual):
-                            img = self.encode_image(visual)
-                            imgs.append(img)
+                            img_data, media_type = self.encode_image(visual)
+                            imgs.append((img_data, media_type))
                         elif isinstance(visual, Image.Image):
-                            img = self.encode_image(visual)
-                            imgs.append(img)
+                            img_data, media_type = self.encode_image(visual)
+                            imgs.append((img_data, media_type))
 
-                payload = {"messages": []}
-                payload["model"] = self.model_version
-
-                payload["messages"].append({"role": "user", "content": []})
-                # Add images first, then text (consistent with vllm implementation)
-                for img in imgs:
-                    payload["messages"][0]["content"].append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img}"}})
-                payload["messages"][0]["content"].append({"type": "text", "text": context})
+                content = [{"type": "text", "text": context}]
+                for img_data, media_type in imgs:
+                    content.append({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_data}})
 
                 if "max_new_tokens" not in gen_kwargs:
                     gen_kwargs["max_new_tokens"] = 1024
                 if gen_kwargs["max_new_tokens"] > 4096:
                     gen_kwargs["max_new_tokens"] = 4096
-                if "temperature" not in gen_kwargs:
-                    gen_kwargs["temperature"] = 0
-                if "top_p" not in gen_kwargs:
-                    gen_kwargs["top_p"] = None
-                if "num_beams" not in gen_kwargs:
-                    gen_kwargs["num_beams"] = 1
 
-                payload["max_tokens"] = gen_kwargs["max_new_tokens"]
-                payload["temperature"] = gen_kwargs["temperature"]
-
-                if "o1" in self.model_version or "o3" in self.model_version or "gpt-5" in self.model_version:
-                    del payload["temperature"]
-                    if self.reasoning_effort is not None:
-                        payload["reasoning_effort"] = self.reasoning_effort
-                    else:
-                        payload["reasoning_effort"] = "medium"
-                    payload["response_format"] = {"type": "text"}
-                    payload.pop("max_tokens")
-                    payload["max_completion_tokens"] = gen_kwargs["max_new_tokens"]
+                payload = {
+                    "anthropic_version": "bedrock-2023-05-31",
+                    "max_tokens": gen_kwargs["max_new_tokens"],
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": content
+                        }
+                    ]
+                }
 
                 batch_payloads.append(payload)
                 batch_responses.append(None)
@@ -384,24 +305,44 @@ class OpenAICompatible(lmms):
 
                 for attempt in range(self.max_retries):
                     try:
-                        response = self.client.chat.completions.create(**payload)
-                        response_text = response.choices[0].message.content
+                        correlation_id = str(uuid.uuid4())
+                        base_api_url = os.getenv("ANTHROPIC_API_BASE_URL", "https://prod.api.enterprise.internal")
+                        url = f"{base_api_url}/llm/v1/aws/model/{self.model_name}/invoke"
+
+                        headers = {
+                            "correlationId": correlation_id,
+                            "dataClassification": "sensitive",
+                            "dataSource": "internet",
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {self.bearer_token}"
+                        }
+
+                        response = http_requests.post(url, headers=headers, json=payload, timeout=120)
+                        response.raise_for_status()
+
+                        result = response.json()
+                        response_text = result.get("content", [{}])[0].get("text", "")
+
+                        input_text = payload["messages"][0]["content"][0]["text"]
+                        eval_logger.info("=" * 64)
+                        eval_logger.info(f"Input text: {input_text}")
+                        eval_logger.info("-" * 64)
+                        eval_logger.info(f"Response text: {response_text}")
+                        eval_logger.info("=" * 64)
+
                         return response_text, i
 
                     except Exception as e:
                         error_msg = str(e)
                         eval_logger.info(f"Attempt {attempt + 1}/{self.max_retries} failed with error: {error_msg}")
 
-                        # Check if token has expired and refresh if needed
                         if "401" in error_msg and "token has expired" in error_msg.lower():
                             eval_logger.info("Token expired, refreshing token and retrying...")
                             try:
-                                self.refresh_token_and_client()
-                                # Don't sleep after token refresh, retry immediately
+                                self.refresh_token()
                                 continue
                             except Exception as refresh_error:
                                 eval_logger.error(f"Failed to refresh token: {refresh_error}")
-                                # Fall through to regular retry logic
 
                         if attempt == self.max_retries - 1:
                             eval_logger.error(f"All {self.max_retries} attempts failed. Last error: {error_msg}")
@@ -437,7 +378,7 @@ class OpenAICompatible(lmms):
         return res
 
     def generate_until_multi_round(self, requests) -> List[str]:
-        raise NotImplementedError("TODO: Implement multi-round generation for OpenAI compatible models")
+        raise NotImplementedError("TODO: Implement multi-round generation for Anthropic compatible models")
 
     def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
-        raise NotImplementedError("TODO: Implement loglikelihood for OpenAI compatible models")
+        raise NotImplementedError("TODO: Implement loglikelihood for Anthropic compatible models")
